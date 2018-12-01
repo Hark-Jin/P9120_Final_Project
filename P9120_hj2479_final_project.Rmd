@@ -7,24 +7,60 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = F)
+knitr::opts_chunk$set(collapse = TRUE)
+library(tidyverse)
+library(janitor)
+library(readxl)
+library(readr)
+library(ggridges)
+library(e1071)
+library(ISLR)
+library(randomForest)
+library(rpart)
+library(caret)
+library(gbm)
+library(pander)
+library(ranger)
 ```
 
-## R Markdown
+# Data Cleaning
+## Preprocessing the data
+```{r}
+autos = read_csv('./data/autos.csv') %>%
+  janitor::clean_names() %>%
+  mutate(repair = recode(not_repaired_damage, `ja` = "Yes", `nein` = "No"),
+         vehicle_type = recode(vehicle_type, `cabrio` = "convertible",
+                               `andere` = "other",
+                               `kleinwagen` = "compact",
+                               `kombi` = "station wagon",
+                               `limousine` = "sedan")) %>%
+  select(-date_crawled, -postal_code, -last_seen, -nr_of_pictures, -date_created,-offer_type, -not_repaired_damage, -month_of_registration) %>%
+  filter(power_ps > 50 & power_ps <= 1000, price >= 1000 & price <= 150000,  year_of_registration > 1950 & year_of_registration <= 2016) %>%
+  mutate(car_age = 2016 - year_of_registration + 1) %>%
+  select(-year_of_registration, -name, -model, -seller, -abtest)
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+for (i in 1:ncol(autos)) {
+  autos[is.na(autos[,i]), i] <- 'NA'
+}
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+autos$price <- as.numeric(autos$price)
+autos$power_ps <- as.numeric(autos$power_ps)
+autos$kilometer <- as.numeric(autos$kilometer)
+autos$car_age <- as.numeric(autos$car_age)
+autos$vehicle_type = as.factor(autos$vehicle_type)
+autos$gearbox = as.factor(autos$gearbox)
+autos$fuel_type = as.factor(autos$fuel_type)
+autos$repair = as.factor(autos$repair)
 ```
 
-## Including Plots
+## Sampling
+```{r}
+autos =  autos %>%
+  filter(brand == "audi" | brand == "bmw" | brand == "mercedes_benz"
+         | brand == "opel" | brand == "volkswagen" | brand == "porsche") %>%
+  filter(vehicle_type != "bus") 
 
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+autos$brand = as.factor(autos$brand)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
