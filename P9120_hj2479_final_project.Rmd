@@ -27,7 +27,7 @@ library(ranger)
 # Data Cleaning
 ## Preprocessing the data
 ```{r}
-autos = read_csv('./data/autos.csv') %>%
+autos = read_csv('../data/autos.csv') %>%
   janitor::clean_names() %>%
   mutate(repair = recode(not_repaired_damage, `ja` = "Yes", `nein` = "No"),
          vehicle_type = recode(vehicle_type, `cabrio` = "convertible",
