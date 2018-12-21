@@ -13,14 +13,12 @@ library(tidyverse)
 library(janitor)
 library(readxl)
 library(readr)
-library(ggridges)
 library(e1071)
 library(ISLR)
 library(randomForest)
 library(rpart)
 library(caret)
 library(gbm)
-library(pander)
 library(ranger)
 ```
 
@@ -40,9 +38,7 @@ autos = read_csv('../data/autos.csv') %>%
   mutate(car_age = 2016 - year_of_registration + 1) %>%
   select(-year_of_registration, -name, -model, -seller, -abtest)
 
-for (i in 1:ncol(autos)) {
-  autos[is.na(autos[,i]), i] <- 'NA'
-}
+autos = autos[complete.cases(autos), ]
 
 autos$price <- as.numeric(autos$price)
 autos$power_ps <- as.numeric(autos$power_ps)
@@ -59,8 +55,348 @@ autos$repair = as.factor(autos$repair)
 autos =  autos %>%
   filter(brand == "audi" | brand == "bmw" | brand == "mercedes_benz"
          | brand == "opel" | brand == "volkswagen" | brand == "porsche") %>%
-  filter(vehicle_type != "bus") 
+  filter(vehicle_type != "bus")
 
+set.seed(123)
 autos$brand = as.factor(autos$brand)
+n_row = sample(dim(autos)[1],12000,replace = FALSE)
+auto_sample = autos[n_row,]
+train = sample(1:nrow(auto_sample), 10000)
+train.auto = auto_sample[train,]
+test.auto = auto_sample[-train,]
+```
+
+# Fit the model
+## Random Forest
+```{r}
+set.seed(123)
+system.time(
+ randomForest(price~., data = train.auto, subset = train, 
+                       mtry = 2, importance = TRUE, na.action = na.roughfix)
+  )
+
+rf.auto = randomForest(price~., data = train.auto, subset = train, 
+                       mtry = 2, importance = TRUE, na.action = na.roughfix)
+varImp(rf.auto)
+varImpPlot(rf.auto)
+pred.test.rf = predict(rf.auto, newdata = test.auto)
+caret::RMSE(pred.test.rf, test.auto$price)
+```
+
+## Turning RF in Ranger
+```{r}
+hyper_grid_rf = expand.grid(
+  mtry       = seq(2, 6, by = 1),
+  node_size  = seq(3, 9, by = 2),
+  sampe_size = c(.55, .632, .70, .80),
+  OOB_RMSE   = 0)
+
+for (i in 1:nrow(hyper_grid_rf)) {
+  # train model
+  model = ranger(
+    formula         = price ~ ., 
+    data            = train.auto, 
+    num.trees       = 500,
+    mtry            = hyper_grid_rf$mtry[i],
+    min.node.size   = hyper_grid_rf$node_size[i],
+    sample.fraction = hyper_grid_rf$sampe_size[i],
+    seed            = 123)
+  
+  # add OOB error to grid
+  hyper_grid_rf$OOB_RMSE[i] <- sqrt(model$prediction.error)
+}
+
+hyper_grid_rf %>% 
+  dplyr::arrange(OOB_RMSE) %>%
+  head(10)
+
+set.seed(123)
+optimal_ranger = ranger(
+    formula         = price ~ ., 
+    data            = train.auto, 
+    num.trees       = 500,
+    mtry            = 3,
+    min.node.size   = 3,
+    sample.fraction = 0.8,
+    importance      = 'impurity')
+
+pred.test.ranger = predict(optimal_ranger, test.auto)
+caret::RMSE(pred.test.ranger$predictions, test.auto$price)
+
+optimal_ranger$variable.importance %>% 
+  broom::tidy() %>%
+  dplyr::arrange(desc(x)) %>%
+  dplyr::top_n(25) %>%
+  ggplot(aes(reorder(names, x), x)) +
+  geom_col() +
+  coord_flip()
+
+system.time(ranger(
+    formula         = price ~ ., 
+    data            = train.auto, 
+    num.trees       = 500,
+    mtry            = 3,
+    min.node.size   = 3,
+    sample.fraction = 0.8,
+    importance      = 'impurity')
+)
+```
+
+## h2o for RF
+```{r}
+library(h2o)
+# h20 for RF
+h2o.no_progress()
+h2o.init(max_mem_size = "5g")
+y <- "price"
+x <- setdiff(names(train.auto), y)
+train.h2o <- as.h2o(train.auto)
+test.h2o <- as.h2o(test.auto)
+
+# RF serach
+hyper_grid.h2o <- list(
+  ntrees      = 500,
+  mtries      = seq(2, 6, by = 1),
+  max_depth   = seq(20, 40, by = 5),
+  min_rows    = seq(1, 5, by = 2),
+  nbins       = seq(10, 30, by = 5),
+  sample_rate = c(.55, .632, .70, .80))
+
+search_criteria <- list(
+  strategy = "RandomDiscrete",
+  stopping_metric = "mse",
+  stopping_tolerance = 0.005,
+  stopping_rounds = 10,
+  max_runtime_secs = 60*20)
+
+# build grid search 
+random_grid <- h2o.grid(
+  algorithm = "randomForest",
+  grid_id = "rf_grid",
+  x = x, 
+  y = y, 
+  training_frame = train.h2o,
+  hyper_params = hyper_grid.h2o,
+  search_criteria = search_criteria)
+
+# collect the results and sort by our model performance metric of choice
+grid_perf2 <- h2o.getGrid(
+  grid_id = "rf_grid", 
+  sort_by = "mse", 
+  decreasing = FALSE)
+print(grid_perf2)
+
+best_model_id_rf <- grid_perf2@model_ids[[1]]
+best_model_rf <- h2o.getModel(best_model_id_rf)
+
+# Model performance on a test set
+best_rf <- h2o.performance(model = best_model_rf, newdata = test.h2o)
+
+# RMSE of best model
+h2o.mse(best_rf) %>% sqrt()
+
+# Time
+system.time(
+  h2o.randomForest(
+  x = x,
+  y = y,
+  training_frame = train.h2o,
+  ntrees = 500,
+  mtries      = 3,
+  max_depth   = 25,
+  min_rows    = 1,
+  nbins       = 20,
+  sample_rate = .70,
+  seed = 123)
+)
+```
+
+## GBM
+```{r}
+set.seed(123)
+gbm.auto = gbm(
+  formula = price ~ .,
+  distribution = "gaussian",
+  data = train.auto,
+  n.trees = 500,
+  interaction.depth = 1,
+  cv.folds = 5,
+  n.cores = NULL, 
+  verbose = FALSE) 
+
+system.time(
+  gbm(formula = price ~ .,
+      distribution = "gaussian",
+      data = train.auto,
+      n.trees = 500,
+      interaction.depth = 1,
+      cv.folds = 5,
+      n.cores = NULL,
+      verbose = FALSE) 
+)
+
+pred.test.gbm = predict(gbm.auto, newdata = test.auto)
+caret::RMSE(pred.test.gbm, test.auto$price)
+```
+
+## Turning GBM
+```{r}
+hyper_grid_gbm = expand.grid(
+  shrinkage = c(.01, 0.05, .1),
+  interaction.depth = c(5, 7, 9),
+  n.minobsinnode = c(3, 5),
+  bag.fraction = c(.65, .8, 1), 
+  optimal_trees = 0,               
+  min_RMSE = 0)
+
+for (i in 1:nrow(hyper_grid_gbm)) {
+  # reproducibility
+  set.seed(123)
+  
+  # train model
+  gbm.tune <- gbm(
+    formula = price ~ .,
+    distribution = "gaussian",
+    data = train.auto,
+    n.trees = 5000,
+    interaction.depth = hyper_grid_gbm$interaction.depth[i],
+    shrinkage = hyper_grid_gbm$shrinkage[i],
+    n.minobsinnode = hyper_grid_gbm$n.minobsinnode[i],
+    bag.fraction = hyper_grid_gbm$bag.fraction[i],
+    train.fraction = 0.75,
+    n.cores = NULL, 
+    verbose = FALSE)
+  
+  # add min training error and trees to grid
+  hyper_grid_gbm$optimal_trees[i] <- which.min(gbm.tune$valid.error)
+  hyper_grid_gbm$min_RMSE[i] <- sqrt(min(gbm.tune$valid.error))
+}
+
+hyper_grid_gbm %>% 
+  dplyr::arrange(min_RMSE) %>%
+  head(10)
+
+gbm.best = gbm(
+    formula = price ~ .,
+    distribution = "gaussian",
+    data = train.auto,
+    n.trees = 4925,
+    interaction.depth = 5,
+    shrinkage = 0.01,
+    n.minobsinnode = 5,
+    bag.fraction = 1,
+    n.cores = NULL,
+    verbose = FALSE)
+
+pred.test.gbm = predict(gbm.best, n.trees = 4925,newdata = test.auto)
+caret::RMSE(pred.test.gbm, test.auto$price)
+
+par(mar = c(5, 8, 1, 1))
+summary(
+  gbm.best, 
+  cBars = 10,
+  method = relative.influence, 
+  las = 2)
+
+system.time(
+  gbm(
+    formula = price ~ .,
+    distribution = "gaussian",
+    data = train.auto,
+    n.trees = 4925,
+    interaction.depth = 5,
+    shrinkage = 0.01,
+    n.minobsinnode = 5,
+    bag.fraction = 1,
+    n.cores = NULL,
+    verbose = FALSE)
+)
+```
+
+## h2o for GBM
+```{r}
+split <- h2o.splitFrame(train.h2o, ratios = 0.75)
+train <- split[[1]]
+valid <- split[[2]]
+hyper_grid <- list(
+  max_depth = c(5, 7, 9, 11, 13),
+  min_rows = c(1, 4, 8, 16),
+  learn_rate = c(0.01, 0.05),
+  learn_rate_annealing = c(.99, 1),
+  sample_rate = c(.5, .75, 1),
+  col_sample_rate = c(.8, .9, 1)
+)
+search_criteria <- list(
+  strategy = "RandomDiscrete",
+  stopping_metric = "mse",
+  stopping_tolerance = 0.005,
+  stopping_rounds = 10,
+  max_runtime_secs = 60*20)
+
+grid <- h2o.grid(
+  algorithm = "gbm",
+  grid_id = "gbm_grid",
+  x = x, 
+  y = y, 
+  training_frame = train,
+  validation_frame = valid,
+  hyper_params = hyper_grid,
+  search_criteria = search_criteria,
+  ntrees = 5000,
+  stopping_rounds = 10,
+  stopping_tolerance = 0.0005,
+  seed = 123)
+
+grid_perf <- h2o.getGrid(
+  grid_id = "gbm_grid", 
+  sort_by = "mse", 
+  decreasing = FALSE
+  )
+grid_perf
+
+h2o.final <- h2o.gbm(
+  x = x,
+  y = y,
+  training_frame = train.h2o,
+  nfolds = 5,
+  ntrees = 5000,
+  learn_rate = 0.01,
+  learn_rate_annealing = 1,
+  max_depth = 5,
+  min_rows = 4,
+  sample_rate = 0.75,
+  col_sample_rate = 0.8,
+  stopping_rounds = 10,
+  stopping_tolerance = 0,
+  seed = 123
+)
+
+# CV error 
+h2o.rmse(h2o.final, xval = TRUE)
+
+# Performance on a test set
+best_gbm <- h2o.performance(model = h2o.final, newdata = test.h2o)
+
+# Test RMSE of best model
+h2o.mse(best_gbm) %>% sqrt()
+
+# Time 
+system.time(
+  h2o.gbm(
+  x = x,
+  y = y,
+  training_frame = train.h2o,
+  nfolds = 5,
+  ntrees = 5000,
+  learn_rate = 0.01,
+  learn_rate_annealing = 1,
+  max_depth = 5,
+  min_rows = 4,
+  sample_rate = 0.75,
+  col_sample_rate = 0.8,
+  stopping_rounds = 10,
+  stopping_tolerance = 0,
+  seed = 123)
+)
 ```
 
